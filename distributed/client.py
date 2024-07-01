@@ -103,7 +103,6 @@ from distributed.utils import (
     format_dashboard_link,
     has_keyword,
     import_term,
-    is_python_shutting_down,
     log_errors,
     nbytes,
     sync,
@@ -133,6 +132,68 @@ DEFAULT_EXTENSIONS = {
 }
 
 TOPIC_PREFIX_FORWARDED_LOG_RECORD = "forwarded-log-record"
+
+
+class FutureCancelledError(CancelledError):
+    key: str
+    reason: str
+    msg: str | None
+
+    def __init__(self, key: str, reason: str | None, msg: str | None = None):
+        self.key = key
+        self.reason = reason if reason else "unknown"
+        self.msg = msg
+
+    def __str__(self) -> str:
+        result = f"{self.key} cancelled for reason: {self.reason}."
+        if self.msg:
+            result = "\n".join([result, self.msg])
+        return result
+
+
+class FuturesCancelledError(CancelledError):
+    error_groups: list[CancelledFuturesGroup]
+
+    def __init__(self, error_groups: list[CancelledFuturesGroup]):
+        self.error_groups = sorted(
+            error_groups, key=lambda group: len(group.errors), reverse=True
+        )
+
+    def __str__(self):
+        count = sum(map(lambda group: len(group.errors), self.error_groups))
+        result = f"{count} Future{'s' if count > 1 else ''} cancelled:"
+        return "\n".join(
+            [result, "Reasons:"] + [str(group) for group in self.error_groups]
+        )
+
+
+class CancelledFuturesGroup:
+    #: Errors of the cancelled futures
+    errors: list[FutureCancelledError]
+
+    #: Reason for cancelling the futures
+    reason: str
+
+    __slots__ = tuple(__annotations__)
+
+    def __init__(self, errors: list[FutureCancelledError], reason: str):
+        self.errors = errors
+        self.reason = reason
+
+    def __str__(self):
+        keys = [error.key for error in self.errors]
+        example_message = None
+
+        for error in self.errors:
+            if error.msg:
+                example_message = error.msg
+                break
+
+        return (
+            f"{len(keys)} Future{'s' if len(keys) > 1 else ''} cancelled for reason: "
+            f"{self.reason}.\nMessage: {example_message}\n"
+            f"Future{'s' if len(keys) > 1 else ''}: {keys}"
+        )
 
 
 class SourceCode(NamedTuple):
@@ -210,6 +271,8 @@ class Future(WrappedKey):
     Client:  Creates futures
     """
 
+    _is_finalizing: staticmethod[[], bool] = staticmethod(sys.is_finalizing)
+
     _cb_executor = None
     _cb_executor_pid = None
     _counter = itertools.count()
@@ -245,7 +308,7 @@ class Future(WrappedKey):
             if self.key in self._client.futures:
                 self._state = self._client.futures[self.key]
             else:
-                self._state = self._client.futures[self.key] = FutureState()
+                self._state = self._client.futures[self.key] = FutureState(self.key)
 
             if self._inform:
                 self._client._send_to_scheduler(
@@ -337,8 +400,10 @@ class Future(WrappedKey):
                 raise exc.with_traceback(tb)
             else:
                 return exc
-        elif self.status == "cancelled":
-            exception = CancelledError(self.key)
+        elif self.cancelled():
+            assert self._state
+            exception = self._state.exception
+            assert isinstance(exception, CancelledError)
             if raiseit:
                 raise exception
             else:
@@ -414,7 +479,7 @@ class Future(WrappedKey):
             done_callback, self, partial(cls._cb_executor.submit, execute_callback)
         )
 
-    def cancel(self, **kwargs):
+    def cancel(self, reason=None, msg=None, **kwargs):
         """Cancel the request to run this future
 
         See Also
@@ -422,7 +487,7 @@ class Future(WrappedKey):
         Client.cancel
         """
         self._verify_initialized()
-        return self.client.cancel([self], **kwargs)
+        return self.client.cancel([self], reason=reason, msg=msg, **kwargs)
 
     def retry(self, **kwargs):
         """Retry this future if it has failed
@@ -522,7 +587,7 @@ class Future(WrappedKey):
         except AttributeError:
             # Occasionally we see this error when shutting down the client
             # https://github.com/dask/distributed/issues/4305
-            if not is_python_shutting_down():
+            if not self._is_finalizing():
                 raise
         except RuntimeError:  # closed event loop
             pass
@@ -552,11 +617,14 @@ class FutureState:
     This is shared between all Futures with the same key and client.
     """
 
-    __slots__ = ("_event", "status", "type", "exception", "traceback")
+    __slots__ = ("_event", "key", "status", "type", "exception", "traceback")
 
-    def __init__(self):
+    def __init__(self, key: str):
         self._event = None
+        self.key = key
+        self.exception = None
         self.status = "pending"
+        self.traceback = None
         self.type = None
 
     def _get_event(self):
@@ -568,10 +636,10 @@ class FutureState:
             event = self._event = asyncio.Event()
         return event
 
-    def cancel(self):
+    def cancel(self, reason=None, msg=None):
         """Cancels the operation"""
         self.status = "cancelled"
-        self.exception = CancelledError()
+        self.exception = FutureCancelledError(key=self.key, reason=reason, msg=msg)
         self._get_event().set()
 
     def finish(self, type=None):
@@ -832,6 +900,8 @@ class Client(SyncMethodMixin):
     distributed.scheduler.Scheduler: Internal scheduler
     distributed.LocalCluster:
     """
+
+    _is_finalizing: staticmethod[[], bool] = staticmethod(sys.is_finalizing)
 
     _instances: ClassVar[weakref.WeakSet[Client]] = weakref.WeakSet()
 
@@ -1321,7 +1391,13 @@ class Client(SyncMethodMixin):
         self.scheduler_comm = None
 
         for st in self.futures.values():
-            st.cancel()
+            st.cancel(
+                reason="scheduler-connection-lost",
+                msg=(
+                    "Client lost the connection to the scheduler. "
+                    "Please check your connection and re-run your work."
+                ),
+            )
         self.futures.clear()
 
         timeout = self._timeout
@@ -1555,7 +1631,7 @@ class Client(SyncMethodMixin):
                 try:
                     msgs = await self.scheduler_comm.comm.read()
                 except CommClosedError:
-                    if is_python_shutting_down():
+                    if self._is_finalizing():
                         return
                     if self.status == "running":
                         if self.cluster and self.cluster.status in (
@@ -1640,7 +1716,10 @@ class Client(SyncMethodMixin):
     def _handle_restart(self):
         logger.info("Receive restart signal from scheduler")
         for state in self.futures.values():
-            state.cancel()
+            state.cancel(
+                reason="scheduler-restart",
+                msg="Scheduler has restarted. Please re-run your work.",
+            )
         self.futures.clear()
         self.generation += 1
         with self._refcount_lock:
@@ -1776,7 +1855,7 @@ class Client(SyncMethodMixin):
         sync(self.loop, self._close, fast=True, callback_timeout=timeout)
         assert self.status == "closed"
 
-        if not is_python_shutting_down():
+        if not self._is_finalizing():
             self._loop_runner.stop()
 
     async def _shutdown(self):
@@ -2220,19 +2299,15 @@ class Client(SyncMethodMixin):
 
             exceptions = set()
             bad_keys = set()
-            for key in keys:
-                if key not in self.futures or self.futures[key].status in failed:
+            for future in future_set:
+                key = future.key
+                if key not in self.futures or future.status in failed:
                     exceptions.add(key)
                     if errors == "raise":
-                        try:
-                            st = self.futures[key]
-                            exception = st.exception
-                            traceback = st.traceback
-                        except (KeyError, AttributeError):
-                            exc = CancelledError(key)
-                        else:
-                            raise exception.with_traceback(traceback)
-                        raise exc
+                        st = future._state
+                        exception = st.exception
+                        traceback = st.traceback
+                        raise exception.with_traceback(traceback)
                     if errors == "skip":
                         bad_keys.add(key)
                         bad_data[key] = None
@@ -2602,16 +2677,16 @@ class Client(SyncMethodMixin):
             hash=hash,
         )
 
-    async def _cancel(self, futures, force=False):
+    async def _cancel(self, futures, reason=None, msg=None, force=False):
         # FIXME: This method is asynchronous since interacting with the FutureState below requires an event loop.
         keys = list({f.key for f in futures_of(futures)})
         self._send_to_scheduler({"op": "cancel-keys", "keys": keys, "force": force})
         for k in keys:
             st = self.futures.pop(k, None)
             if st is not None:
-                st.cancel()
+                st.cancel(reason=reason, msg=msg)
 
-    def cancel(self, futures, asynchronous=None, force=False):
+    def cancel(self, futures, asynchronous=None, force=False, reason=None, msg=None):
         """
         Cancel running futures
         This stops future tasks from being scheduled if they have not yet run
@@ -2626,8 +2701,14 @@ class Client(SyncMethodMixin):
             If True the client is in asynchronous mode
         force : boolean (False)
             Cancel this future even if other clients desire it
+        reason: str
+            Reason for cancelling the futures
+        msg : str
+            Message that will be attached to the cancelled future
         """
-        return self.sync(self._cancel, futures, asynchronous=asynchronous, force=force)
+        return self.sync(
+            self._cancel, futures, asynchronous=asynchronous, force=force, msg=msg
+        )
 
     async def _retry(self, futures):
         keys = list({f.key for f in futures_of(futures)})
@@ -4899,6 +4980,8 @@ class Client(SyncMethodMixin):
         name: str,
         idempotent: bool,
     ):
+        if isinstance(plugin, type):
+            raise TypeError("Please provide an instance of a plugin, not a type.")
         raise TypeError(
             "Registering duck-typed plugins is not allowed. Please inherit from "
             "NannyPlugin, WorkerPlugin, or SchedulerPlugin to create a plugin."
@@ -5445,9 +5528,19 @@ async def _wait(fs, timeout=None, return_when=ALL_COMPLETED):
         {fu for fu in fs if fu.status != "pending"},
         {fu for fu in fs if fu.status == "pending"},
     )
-    cancelled = [f.key for f in done if f.status == "cancelled"]
-    if cancelled:
-        raise CancelledError(cancelled)
+    cancelled_errors = defaultdict(list)
+    for f in done:
+        if not f.cancelled():
+            continue
+        exception = f._state.exception
+        assert isinstance(exception, FutureCancelledError)
+        cancelled_errors[exception.reason].append(exception)
+    if cancelled_errors:
+        groups = [
+            CancelledFuturesGroup(errors=errors, reason=reason)
+            for reason, errors in cancelled_errors.items()
+        ]
+        raise FuturesCancelledError(groups)
 
     return DoneAndNotDoneFutures(done, not_done)
 
@@ -5678,8 +5771,6 @@ class as_completed:
             if self.raise_errors and future.status == "error":
                 typ, exc, tb = result
                 raise exc.with_traceback(tb)
-            elif future.status == "cancelled":
-                res = (res[0], CancelledError(future.key))
         return res
 
     def __next__(self):
@@ -5891,10 +5982,19 @@ def futures_of(o, client=None):
             stack.extend(x.__dask_graph__().values())
 
     if client is not None:
-        bad = {f for f in futures if f.cancelled()}
-        if bad:
-            raise CancelledError(bad)
-
+        cancelled_errors = defaultdict(list)
+        for f in futures:
+            if not f.cancelled():
+                continue
+            exception = f._state.exception
+            assert isinstance(exception, FutureCancelledError)
+            cancelled_errors[exception.reason].append(exception)
+        if cancelled_errors:
+            groups = [
+                CancelledFuturesGroup(errors=errors, reason=reason)
+                for reason, errors in cancelled_errors.items()
+            ]
+            raise FuturesCancelledError(groups)
     return futures[::-1]
 
 

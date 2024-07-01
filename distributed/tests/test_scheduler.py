@@ -198,8 +198,8 @@ def test_decide_worker_coschedule_order_neighbors(ndeps, nthreads):
         generally, only one worker holds each row of the array, that the `random-` tasks
         are never transferred, and that there are few transfers overall.
         """
-        da = pytest.importorskip("dask.array")
         np = pytest.importorskip("numpy")
+        da = pytest.importorskip("dask.array")
 
         if ndeps == 0:
             x = da.random.random((100, 100), chunks=(10, 10))
@@ -865,39 +865,39 @@ async def test_remove_worker_by_name_from_scheduler(s, a, b):
 
 @gen_cluster(config={"distributed.scheduler.events-cleanup-delay": "500 ms"})
 async def test_clear_events_worker_removal(s, a, b):
-    assert a.address in s.events
+    assert a.address in s._broker._topics
     assert a.address in s.workers
-    assert b.address in s.events
+    assert b.address in s._broker._topics
     assert b.address in s.workers
 
     await s.remove_worker(address=a.address, stimulus_id="test")
     # Shortly after removal, the events should still be there
-    assert a.address in s.events
+    assert s.get_events(a.address)
     assert a.address not in s.workers
     s.validate_state()
 
     start = time()
-    while a.address in s.events:
+    while s.get_events(a.address):
         await asyncio.sleep(0.01)
         assert time() < start + 2
-    assert b.address in s.events
+    assert b.address in s._broker._topics
 
 
 @gen_cluster(
     config={"distributed.scheduler.events-cleanup-delay": "10 ms"}, client=True
 )
 async def test_clear_events_client_removal(c, s, a, b):
-    assert c.id in s.events
+    assert s.get_events(c.id)
     s.remove_client(c.id)
 
-    assert c.id in s.events
+    assert s.get_events(c.id)
     assert c.id not in s.clients
     assert c not in s.clients
 
     s.remove_client(c.id)
     # If it doesn't reconnect after a given time, the events log should be cleared
     start = time()
-    while c.id in s.events:
+    while s.get_events(c.id):
         await asyncio.sleep(0.01)
         assert time() < start + 2
 
@@ -1647,7 +1647,9 @@ async def test_retire_workers_no_suspicious_tasks(c, s, a, b):
 @gen_cluster(client=True, nthreads=[], timeout=120)
 async def test_file_descriptors(c, s):
     await asyncio.sleep(0.1)
+    pytest.importorskip("numpy")
     da = pytest.importorskip("dask.array")
+
     proc = psutil.Process()
     num_fds_1 = proc.num_fds()
 
@@ -2106,14 +2108,16 @@ async def test_cancel_fire_and_forget(c, s, a, b):
     await ev2.set()
 
 
-@pytest.mark.slow
+# @pytest.mark.slow
 @gen_cluster(
     client=True, Worker=Nanny, clean_kwargs={"processes": False, "threads": False}
 )
 async def test_log_tasks_during_restart(c, s, a, b):
     future = c.submit(sys.exit, 0)
     await wait(future)
-    assert "exit" in str(s.events)
+    assert "exit" in str(
+        {name: topic.events for name, topic in s._broker._topics.items()}
+    )
 
 
 @gen_cluster(client=True)
@@ -2802,8 +2806,10 @@ async def test_no_dangling_asyncio_tasks():
 
 @gen_cluster(client=True, Worker=NoSchedulerDelayWorker, config=NO_AMM)
 async def test_task_group_and_prefix_statistics(c, s, a, b, no_time_resync):
-    start = time()
+    pytest.importorskip("numpy")
     da = pytest.importorskip("dask.array")
+
+    start = time()
     x = da.arange(100, chunks=(20,))
     y = (x + 1).persist(optimize_graph=False)
     y = await y
@@ -3033,6 +3039,7 @@ async def test_task_group_not_done_processing(c, s, a, b):
 
 @gen_cluster(client=True)
 async def test_task_prefix(c, s, a, b):
+    pytest.importorskip("numpy")
     da = pytest.importorskip("dask.array")
     x = da.arange(100, chunks=(20,))
     y = (x + 1).sum().persist()
@@ -3063,8 +3070,8 @@ async def test_failing_task_increments_suspicious(client, s, a, b):
 
 @gen_cluster(client=True)
 async def test_task_group_non_tuple_key(c, s, a, b):
-    da = pytest.importorskip("dask.array")
     np = pytest.importorskip("numpy")
+    da = pytest.importorskip("dask.array")
     x = da.arange(100, chunks=(20,))
     y = (x + 1).sum().persist()
     y = await y
@@ -3300,22 +3307,6 @@ async def test_retire_state_change(c, s, a, b):
         coros.append(c.gather(step))
     await c.retire_workers(workers=[a.address])
     await asyncio.gather(*coros)
-
-
-@gen_cluster(client=True, config={"distributed.admin.low-level-log-length": 3})
-async def test_configurable_events_log_length(c, s, a, b):
-    s.log_event("test", "dummy message 1")
-    assert len(s.events["test"]) == 1
-    s.log_event("test", "dummy message 2")
-    s.log_event("test", "dummy message 3")
-    assert len(s.events["test"]) == 3
-
-    # adding a fourth message will drop the first one and length stays at 3
-    s.log_event("test", "dummy message 4")
-    assert len(s.events["test"]) == 3
-    assert s.events["test"][0][1] == "dummy message 2"
-    assert s.events["test"][1][1] == "dummy message 3"
-    assert s.events["test"][2][1] == "dummy message 4"
 
 
 @gen_cluster()
@@ -4447,7 +4438,7 @@ async def test_ensure_events_dont_include_taskstate_objects(c, s, a, b):
     await event.set()
     await c.gather(futs)
 
-    assert "TaskState" not in str(s.events)
+    assert not any("TaskState" in str(event) for event in s.get_events())
 
 
 @gen_cluster(nthreads=[("", 1)])
@@ -4474,9 +4465,8 @@ async def test_scheduler_close_fast_deprecated(s, w):
 
 def test_runspec_regression_sync(loop):
     # https://github.com/dask/distributed/issues/6624
-
-    da = pytest.importorskip("dask.array")
     np = pytest.importorskip("numpy")
+    da = pytest.importorskip("dask.array")
     with Client(loop=loop):
         v = da.random.random((20, 20), chunks=(5, 5))
 
@@ -4648,6 +4638,47 @@ async def test_deadlock_resubmit_queued_tasks_fast(c, s, a, rootish):
     await block2.set()
     await c.gather(fut2)
     await c.gather(fut3)
+
+
+@pytest.mark.skipif(
+    not QUEUING_ON_BY_DEFAULT,
+    reason="The situation handled in this test requires queueing.",
+)
+@gen_cluster(client=True, nthreads=[("", 1)])
+async def test_deadlock_dependency_of_queued_released(c, s, a):
+    @delayed
+    def inc(input):
+        return input + 1
+
+    @delayed
+    def block_on_event(input, block, executing):
+        executing.set()
+        block.wait()
+        return input
+
+    block = Event()
+    executing = Event()
+
+    dep = inc(0)
+    futs = [
+        block_on_event(dep, block, executing, dask_key_name=("rootish", i))
+        for i in range(s.total_nthreads * 2 + 1)
+    ]
+    del dep
+    futs = c.compute(futs)
+    await executing.wait()
+    assert s.queued
+    await s.remove_worker(address=a.address, stimulus_id="test")
+
+    s.validate_state()
+
+    await block.set()
+    await executing.clear()
+
+    async with Worker(s.address) as b:
+        s.validate_state()
+        await c.gather(*futs)
+        s.validate_state()
 
 
 @gen_cluster(client=True)

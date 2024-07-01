@@ -18,7 +18,6 @@ from concurrent.futures.process import BrokenProcessPool
 from numbers import Number
 from operator import add
 from time import sleep
-from unittest import mock
 
 import psutil
 import pytest
@@ -49,7 +48,7 @@ from distributed.diagnostics.plugin import ForwardOutput
 from distributed.metrics import time
 from distributed.protocol import pickle
 from distributed.scheduler import KilledWorker, Scheduler
-from distributed.utils import wait_for
+from distributed.utils import get_mp_context, wait_for
 from distributed.utils_test import (
     NO_AMM,
     BlockedExecute,
@@ -868,39 +867,6 @@ async def test_dont_overlap_communications_to_same_worker(c, s, a, b):
     assert l1["stop"] < l2["start"]
 
 
-@gen_cluster(client=True, nthreads=[("", 1)])
-async def test_log_event(c, s, a):
-    def log_event(msg):
-        w = get_worker()
-        w.log_event("test-topic", msg)
-
-    await c.submit(log_event, "foo")
-
-    class C:
-        pass
-
-    with pytest.raises(TypeError, match="msgpack"):
-        await c.submit(log_event, C())
-
-    # Worker still works
-    await c.submit(log_event, "bar")
-    await c.submit(log_event, error_message(Exception()))
-
-    # assertion reversed for mock.ANY.__eq__(Serialized())
-    assert [
-        "foo",
-        "bar",
-        {
-            "status": "error",
-            "exception": mock.ANY,
-            "traceback": mock.ANY,
-            "exception_text": "Exception()",
-            "traceback_text": "",
-            "worker": a.address,
-        },
-    ] == [msg[1] for msg in s.get_events("test-topic")]
-
-
 @gen_cluster(client=True)
 async def test_log_exception_on_failed_task(c, s, a, b):
     with captured_logger("distributed.worker") as logger:
@@ -1217,7 +1183,9 @@ async def test_statistical_profiling(c, s, a, b):
     },
 )
 async def test_statistical_profiling_2(c, s, a, b):
+    pytest.importorskip("numpy")
     da = pytest.importorskip("dask.array")
+
     while True:
         x = da.random.random(1000000, chunks=(10000,))
         y = (x + x * 2) - x.sum().persist()
@@ -2199,7 +2167,7 @@ async def test_bad_executor_annotation(c, s, a, b):
 
 @gen_cluster(client=True)
 async def test_process_executor(c, s, a, b):
-    with ProcessPoolExecutor() as e:
+    with ProcessPoolExecutor(mp_context=get_mp_context()) as e:
         a.executors["processes"] = e
         b.executors["processes"] = e
 
@@ -2231,7 +2199,7 @@ def kill_process():
 
 @gen_cluster(nthreads=[("127.0.0.1", 1)], client=True)
 async def test_process_executor_kills_process(c, s, a):
-    with ProcessPoolExecutor() as e:
+    with ProcessPoolExecutor(mp_context=get_mp_context()) as e:
         a.executors["processes"] = e
         with dask.annotate(executor="processes", retries=1):
             future = c.submit(kill_process)
@@ -2254,7 +2222,7 @@ def raise_exc():
 
 @gen_cluster(client=True)
 async def test_process_executor_raise_exception(c, s, a, b):
-    with ProcessPoolExecutor() as e:
+    with ProcessPoolExecutor(mp_context=get_mp_context()) as e:
         a.executors["processes"] = e
         b.executors["processes"] = e
         with dask.annotate(executor="processes", retries=1):
@@ -2938,7 +2906,7 @@ async def test_worker_status_sync(s, a):
     while ws.status != Status.closed:
         await asyncio.sleep(0.01)
 
-    events = [ev for _, ev in s.events[ws.address] if ev["action"] != "heartbeat"]
+    events = [ev for _, ev in s.get_events(ws.address) if ev["action"] != "heartbeat"]
     for ev in events:
         if "stimulus_id" in ev:  # Strip timestamp
             ev["stimulus_id"] = ev["stimulus_id"].rsplit("-", 1)[0]
@@ -2995,7 +2963,7 @@ async def test_log_remove_worker(c, s, a, b):
     # Scattered task
     z = await c.scatter({"z": 3}, workers=a.address)
 
-    s.events.clear()
+    s._broker.truncate()
 
     with captured_logger("distributed.scheduler", level=logging.INFO) as log:
         # Successful graceful shutdown
@@ -3031,7 +2999,7 @@ async def test_log_remove_worker(c, s, a, b):
         "Lost all workers",
     ]
 
-    events = {topic: [ev for _, ev in evs] for topic, evs in s.events.items()}
+    events = {topic: [ev for _, ev in evs] for topic, evs in s.get_events().items()}
     for evs in events.values():
         for ev in evs:
             if ev["action"] == "retire-workers":
@@ -3455,7 +3423,8 @@ class BreakingWorker(Worker):
 @pytest.mark.slow
 @gen_cluster(client=True, Worker=BreakingWorker)
 async def test_broken_comm(c, s, a, b):
-    pytest.importorskip("dask.dataframe")
+    pytest.importorskip("pandas")
+    dd = pytest.importorskip("dask.dataframe")
 
     df = dask.datasets.timeseries(
         start="2000-01-01",
